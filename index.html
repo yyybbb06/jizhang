@@ -1578,7 +1578,8 @@ async function handleAuthSubmit(e) {
     useSupabase = true;
     hideAuth();
     await refreshData();
-    showToast('✅ 欢迎，' + (sessionUser.email || sessionUser.id));
+    const bridgeOk = !!(window.AndroidBridge && typeof window.AndroidBridge.onSessionChanged === 'function');
+    showToast('✅ 欢迎，' + (sessionUser.email || sessionUser.id) + (bridgeOk ? '（手机组件已连接）' : ''));
   } catch (err) {
     console.error(err);
     showAuthError(friendlyAuthError(err.message));
