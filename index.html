@@ -672,6 +672,12 @@ const store = {
         } else {
           sessionUser = null; // 未登录，稍后显示登录页
         }
+        // token 自动刷新（约每小时一次）时同步给原生侧，避免小组件凭证过期
+        if (supabaseClient.auth && typeof supabaseClient.auth.onAuthStateChange === 'function') {
+          supabaseClient.auth.onAuthStateChange((event, session) => {
+            notifyNativeSession(session ? session.access_token : '');
+          });
+        }
         useSupabase = true;
       } catch (e) {
         console.warn('Supabase 初始化失败，回退到 localStorage：', e);
@@ -910,6 +916,7 @@ async function saveRecord(e) {
   try {
     await store.upsertRecord(rec);
     showToast(editingId ? '✅ 记录已更新' : '✅ 记账成功');
+    notifyNativeDataChanged();
     resetForm();
     await refreshData();
   } catch (err) {
@@ -927,6 +934,7 @@ async function deleteRecord(id) {
   try {
     await store.deleteRecord(id);
     showToast('🗑️ 已删除');
+    notifyNativeDataChanged();
     await refreshData();
   } catch (err) {
     console.error(err);
@@ -1462,6 +1470,7 @@ function handleImport(file) {
       await store.replaceAll(cleanRecs, cleanBuds);
       localStorage.setItem(SEED_FLAG_KEY, '1');
       showToast('✅ 导入成功，共 ' + cleanRecs.length + ' 条记录');
+      notifyNativeDataChanged();
       await refreshData();
     } catch (err) {
       console.error(err);
@@ -1520,6 +1529,12 @@ function friendlyAuthError(raw) {
 function notifyNativeSession(token) {
   if (window.AndroidBridge && typeof window.AndroidBridge.onSessionChanged === 'function') {
     try { window.AndroidBridge.onSessionChanged(token || ''); } catch (e) {}
+  }
+}
+/* 原生 App 桥：数据变化时通知原生侧立即刷新桌面小组件 */
+function notifyNativeDataChanged() {
+  if (window.AndroidBridge && typeof window.AndroidBridge.onDataChanged === 'function') {
+    try { window.AndroidBridge.onDataChanged(); } catch (e) {}
   }
 }
 async function getAccessToken() {
