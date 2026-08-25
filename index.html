@@ -1765,6 +1765,8 @@ async function init() {
   document.getElementById('statsDateInput').value = statsDate;
   const existingBudget = budgets.find(b => b.month === curMonth());
   document.getElementById('budgetAmount').value = existingBudget ? existingBudget.budget : '';
+  // 初始化记账表单（默认支出类别网格，首次打开即显示）
+  resetForm();
   // 初始化存储
   await store.init();
   if (store.isSupabase()) {
