@@ -4,10 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>学生每日记账工作台</title>
-<!-- Supabase 客户端（本地化，避免 CDN 不可达导致回退 localStorage） -->
-<script src="vendor/supabase.min.js"></script>
+<!-- Supabase 客户端（本地化，避免 CDN 不可达导致回退 localStorage）
+     必须加 defer：脚本共约 420KB，阻塞加载会让页面在弱网下白屏数十秒；
+     defer 保证 DOM 先渲染，且仍在 DOMContentLoaded 之前执行完毕。 -->
+<script defer src="vendor/supabase.min.js"></script>
 <!-- Chart.js（本地化） -->
-<script src="vendor/chart.umd.js"></script>
+<script defer src="vendor/chart.umd.js"></script>
 <style>
 /* ========== 主题变量 ========== */
 :root{
@@ -572,10 +574,37 @@ let useSupabase = false;     // 是否启用 Supabase
 let supabaseClient = null;
 let sessionUser = null;      // 当前用户：Supabase 用户对象 / 'local'
 let authMode = 'login';      // 登录页模式：login | register
+let pendingSessionRecovery = false; // 会话恢复超时中（等 onAuthStateChange 兜底）
+let recoveryTimer = null;
+let storeReady = false;             // store.init() 是否已完成
 let charts = {};             // 图表实例缓存
 let toastTimer = null;
 
+/* 会话恢复兜底定时器：万一 onAuthStateChange 迟迟不给结果，
+   到点仍无会话就按未登录处理，避免用户卡在一个空白界面里。 */
+function armRecoveryFallback() {
+  clearTimeout(recoveryTimer);
+  recoveryTimer = setTimeout(() => {
+    if (!pendingSessionRecovery) return;
+    pendingSessionRecovery = false;
+    if (!sessionUser) {
+      showAuth();
+      switchAuthTabs('login');
+      showToast('⚠️ 登录状态恢复失败，请重新登录');
+    }
+  }, 20000);
+}
+
 /* ===================== 工具函数 ===================== */
+/* 超时哨兵：用于区分「真的没有会话」与「压根没等到结果」 */
+const TIMEOUT = { __timeout: true };
+/* 给 Promise 加超时保护：弱网下不让初始化无限期挂起 */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms)),
+  ]);
+}
 function pad(n) { return String(n).padStart(2, '0'); }
 function toDateStr(d) {
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
@@ -664,19 +693,48 @@ const store = {
           ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
           : null;
         if (!supabaseClient) throw new Error('Supabase 客户端未加载');
-        // 恢复已有会话（邮箱或匿名）；无会话则等待用户登录
-        const { data: sessionData } = await supabaseClient.auth.getSession();
-        if (sessionData.session) {
-          sessionUser = sessionData.session.user;
-          notifyNativeSession(sessionData.session.access_token);
-        } else {
-          sessionUser = null; // 未登录，稍后显示登录页
-        }
-        // token 自动刷新（约每小时一次）时同步给原生侧，避免小组件凭证过期
-        if (supabaseClient.auth && typeof supabaseClient.auth.onAuthStateChange === 'function') {
+        // 先订阅会话变化，再主动取一次。这样即使 getSession() 超时，
+        // 后续的 INITIAL_SESSION / TOKEN_REFRESHED / SIGNED_IN 事件
+        // 仍能把会话和新 token 补给界面与原生小组件。
+        if (typeof supabaseClient.auth.onAuthStateChange === 'function') {
           supabaseClient.auth.onAuthStateChange((event, session) => {
-            notifyNativeSession(session ? session.access_token : '');
+            if (session) {
+              sessionUser = session.user;
+              notifyNativeSession(session);
+              if (pendingSessionRecovery) {
+                pendingSessionRecovery = false;
+                hideAuth();
+                refreshData().catch(e => console.warn('恢复会话后刷新失败：', e));
+                renderAccountCard();
+              }
+            } else if (event === 'SIGNED_OUT') {
+              sessionUser = null;
+              notifyNativeSession(null);
+            } else if (event === 'INITIAL_SESSION' && pendingSessionRecovery) {
+              // Supabase 明确告知「没有会话」，这时才弹登录页
+              pendingSessionRecovery = false;
+              showAuth();
+              switchAuthTabs('login');
+            }
           });
+        }
+        // 若原生侧（小组件续期后）持有更新的会话，先采纳它，避免旧 refresh_token 被复用
+        try { await adoptNativeSession(); } catch (e) { console.warn('采纳原生会话异常：', e); }
+        // 恢复已有会话；弱网下最多等 8 秒，超时不阻塞界面，交给上面的订阅兜底
+        const res = await withTimeout(supabaseClient.auth.getSession(), 8000);
+        if (res === TIMEOUT) {
+          console.warn('恢复会话超时，先渲染界面，等 onAuthStateChange 补会话');
+          pendingSessionRecovery = true;
+          sessionUser = null;
+          armRecoveryFallback();
+        } else {
+          const sessionData = (res && res.data) ? res.data : {};
+          if (sessionData.session) {
+            sessionUser = sessionData.session.user;
+            notifyNativeSession(sessionData.session);
+          } else {
+            sessionUser = null; // 未登录，稍后显示登录页
+          }
         }
         useSupabase = true;
       } catch (e) {
@@ -1525,22 +1583,66 @@ function friendlyAuthError(raw) {
   if (m.includes('Anonymous sign-ins are disabled')) return '项目未开启匿名登录';
   return m || '操作失败，请重试';
 }
-/* 原生 App（Android 小组件）会话桥：把 access_token 同步给原生侧 */
-function notifyNativeSession(token) {
-  if (window.AndroidBridge && typeof window.AndroidBridge.onSessionChanged === 'function') {
-    try { window.AndroidBridge.onSessionChanged(token || ''); } catch (e) {}
-  }
+/* 原生 App（Android 小组件）会话桥
+   把 access_token / refresh_token / expires_at 一并同步给原生侧，
+   使小组件在 token 过期后能自行续期，无需用户打开 App。
+   优先调用新桥 onSessionFull，旧版 APK 上自动降级为 onSessionChanged。 */
+function notifyNativeSession(session) {
+  const bridge = window.AndroidBridge;
+  if (!bridge) return;
+  const token = session ? (session.access_token || '') : '';
+  const refresh = session ? (session.refresh_token || '') : '';
+  const expiresAt = session && session.expires_at ? String(session.expires_at) : '0';
+  try {
+    if (typeof bridge.onSessionFull === 'function') {
+      bridge.onSessionFull(token, refresh, expiresAt);
+    } else if (typeof bridge.onSessionChanged === 'function') {
+      bridge.onSessionChanged(token);
+    }
+  } catch (e) {}
 }
+/* TIMEOUT 哨兵与 withTimeout 定义见上方「工具函数」区 */
 /* 原生 App 桥：数据变化时通知原生侧立即刷新桌面小组件 */
 function notifyNativeDataChanged() {
   if (window.AndroidBridge && typeof window.AndroidBridge.onDataChanged === 'function') {
     try { window.AndroidBridge.onDataChanged(); } catch (e) {}
   }
 }
-async function getAccessToken() {
-  if (!store.isSupabase()) return '';
-  const { data } = await supabaseClient.auth.getSession();
-  return data.session ? data.session.access_token : '';
+/* 取当前完整会话（含 refresh_token / expires_at，供小组件自行续期用） */
+async function getCurrentSession() {
+  if (!store.isSupabase() || !supabaseClient) return null;
+  try {
+    const res = await withTimeout(supabaseClient.auth.getSession(), 8000);
+    if (res === TIMEOUT) return null;
+    return (res && res.data) ? res.data.session : null;
+  } catch (e) { return null; }
+}
+/* 采纳原生侧保存的、仍然有效的会话。
+   小组件在 token 临期时会自行续期并轮换 refresh_token；此时 localStorage 里那份
+   refresh_token 已成旧值，若 WebView 再拿它去刷新，GoTrue 会判定为「令牌复用」
+   并吊销整个会话，把用户强制登出。所以启动时若原生侧的会话更新，就用它对齐。 */
+async function adoptNativeSession() {
+  const bridge = window.AndroidBridge;
+  if (!supabaseClient || !bridge || typeof bridge.getStoredSession !== 'function') return false;
+  let raw = '';
+  try { raw = bridge.getStoredSession() || ''; } catch (e) { return false; }
+  if (!raw) return false;
+  let nat = null;
+  try { nat = JSON.parse(raw); } catch (e) { return false; }
+  if (!nat || !nat.access_token || !nat.refresh_token) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  // 原生侧也过期的话就没有采纳价值，交给下面的正常恢复流程
+  if (!nat.expires_at || Number(nat.expires_at) < nowSec + 30) return false;
+  try {
+    await supabaseClient.auth.setSession({
+      access_token: nat.access_token,
+      refresh_token: nat.refresh_token,
+    });
+    return true;
+  } catch (e) {
+    console.warn('采纳原生会话失败，回退到本地会话：', e);
+    return false;
+  }
 }
 async function handleAuthSubmit(e) {
   e.preventDefault();
@@ -1558,27 +1660,31 @@ async function handleAuthSubmit(e) {
   btn.disabled = true;
   btn.textContent = '请稍候…';
   try {
+    let session = null;
     if (authMode === 'login') {
       const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
       if (error) throw error;
       sessionUser = data.user;
+      session = data.session;
     } else {
-      // 注册：若当前为匿名会话，GoTrue 会自动将其升级为邮箱账号（旧数据保留）
+      // 注册：Supabase 已关闭匿名登录，注册后需邮箱确认再登录
       const { data, error } = await supabaseClient.auth.signUp({ email, password });
       if (error) throw error;
       if (data.session) {
         sessionUser = data.user;
+        session = data.session;
       } else {
         switchAuthTabs('login');
         showAuthError('注册成功！请前往邮箱点击确认链接后返回登录。');
         return;
       }
     }
-    notifyNativeSession(await getAccessToken());
+    // 把完整会话同步给原生侧（小组件靠 refresh_token 自行续期）
+    notifyNativeSession(session || await getCurrentSession());
     useSupabase = true;
     hideAuth();
     await refreshData();
-    const bridgeOk = !!(window.AndroidBridge && typeof window.AndroidBridge.onSessionChanged === 'function');
+    const bridgeOk = !!(window.AndroidBridge && typeof window.AndroidBridge.onSessionFull === 'function');
     showToast('✅ 欢迎，' + (sessionUser.email || sessionUser.id) + (bridgeOk ? '（手机组件已连接）' : ''));
   } catch (err) {
     console.error(err);
@@ -1593,7 +1699,9 @@ async function signOutAccount() {
   if (!confirm('确定退出登录吗？退出后本机将不再显示云端数据。')) return;
   await supabaseClient.auth.signOut();
   sessionUser = null;
-  notifyNativeSession('');
+  pendingSessionRecovery = false;
+  clearTimeout(recoveryTimer);
+  notifyNativeSession(null);
   showAuth();
   switchAuthTabs('login');
   document.getElementById('authEmail').value = '';
@@ -1603,11 +1711,25 @@ function renderAccountCard() {
   const name = document.getElementById('accountName');
   const desc = document.getElementById('accountDesc');
   const btn = document.getElementById('accountActionBtn');
+  if (!storeReady) {
+    name.textContent = '正在检测…';
+    desc.textContent = '正在初始化存储，请稍候';
+    btn.textContent = '…';
+    btn.onclick = null;
+    return;
+  }
   if (!store.isSupabase()) {
     name.textContent = '本地模式';
     desc.textContent = '未使用云存储，无需登录';
     btn.textContent = '—';
     btn.onclick = null;
+    return;
+  }
+  if (pendingSessionRecovery) {
+    name.textContent = '正在恢复登录状态…';
+    desc.textContent = '网络较慢，正在向云端确认会话；若长时间无响应请重新登录';
+    btn.textContent = '重新登录';
+    btn.onclick = () => { switchAuthTabs('login'); showAuth(); };
     return;
   }
   if (!sessionUser) {
@@ -1617,17 +1739,10 @@ function renderAccountCard() {
     btn.onclick = () => { switchAuthTabs('login'); showAuth(); };
     return;
   }
-  if (sessionUser.is_anonymous) {
-    name.textContent = '匿名账号';
-    desc.textContent = '可注册邮箱升级，升级后旧数据保留并支持多端同步';
-    btn.textContent = '绑定邮箱';
-    btn.onclick = () => { switchAuthTabs('register'); showAuth(); };
-  } else {
-    name.textContent = sessionUser.email || sessionUser.id;
-    desc.textContent = '已登录，数据同步中';
-    btn.textContent = '退出登录';
-    btn.onclick = signOutAccount;
-  }
+  name.textContent = sessionUser.email || sessionUser.id;
+  desc.textContent = '已登录，数据同步中';
+  btn.textContent = '退出登录';
+  btn.onclick = signOutAccount;
 }
 
 /* ===================== 存储状态展示 ===================== */
@@ -1638,9 +1753,13 @@ function renderStorageStatus() {
   if (useSupabase) {
     pill.textContent = 'Supabase 云存储';
     pill.classList.remove('off');
-    desc.textContent = sessionUser
-      ? '数据已同步至 Supabase 数据库（records / budgets 表）。'
-      : '已连接 Supabase，登录后数据才会同步。';
+    if (pendingSessionRecovery) {
+      desc.textContent = '正在向云端确认登录状态，请稍候…';
+    } else {
+      desc.textContent = sessionUser
+        ? '数据已同步至 Supabase 数据库（records / budgets 表）。'
+        : '已连接 Supabase，登录后数据才会同步。';
+    }
     note.style.display = 'block';
     document.getElementById('supabaseUrl').textContent = SUPABASE_URL;
   } else {
@@ -1663,11 +1782,16 @@ function syncRangeControls() {
 }
 function renderAll() {
   renderStorageStatus();
+  renderShell();
+}
+/* 只渲染界面主体，不碰「存储状态」——用于存储还没初始化完时先让页面活起来 */
+function renderShell() {
   renderMonthFilter();
   renderRecordList();
   syncRangeControls();
   renderStats();
   renderBalance();
+  renderAccountCard();
 }
 
 /* ===================== 事件绑定 ===================== */
@@ -1767,13 +1891,22 @@ async function init() {
   document.getElementById('budgetAmount').value = existingBudget ? existingBudget.budget : '';
   // 初始化记账表单（默认支出类别网格，首次打开即显示）
   resetForm();
+  // 先渲染界面主体，避免网络慢时整页停在占位状态（「正在检测…」「未登录」）
+  renderShell();
   // 初始化存储
   await store.init();
+  storeReady = true;
   if (store.isSupabase()) {
     if (sessionUser) {
-      // 已登录（邮箱或匿名会话）
+      // 已登录
       hideAuth();
       await refreshData();
+    } else if (pendingSessionRecovery) {
+      // 会话还在恢复中：先让用户进得去，恢复成功后自动隐藏登录页并拉数据
+      hideAuth();
+      renderAll();
+      console.log('记账工作台：等待会话恢复中');
+      return;
     } else {
       // 未登录：显示登录页等待用户操作
       showAuth();
@@ -1781,7 +1914,6 @@ async function init() {
       document.getElementById('authNote').textContent =
         '提示：登录后数据同步到云端，手机与电脑登录同一账号即可互通。';
       renderAll();
-      renderAccountCard();
       console.log('记账工作台待登录：Supabase 模式');
       return;
     }
@@ -1790,8 +1922,8 @@ async function init() {
     hideAuth();
     await refreshData();
   }
-  // 首次使用生成示例数据
-  if (records.length === 0 && !localStorage.getItem(SEED_FLAG_KEY)) {
+  // 首次使用生成示例数据（仅本地模式；云端账号绝不写入假数据）
+  if (!store.isSupabase() && records.length === 0 && !localStorage.getItem(SEED_FLAG_KEY)) {
     await seedSampleData();
     await refreshData();
   }
