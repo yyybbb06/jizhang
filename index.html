@@ -689,6 +689,9 @@ const store = {
   async init() {
     if (SUPABASE_URL && SUPABASE_ANON_KEY) {
       try {
+        // 必须最先执行：把原生侧（小组件续期后）的新会话写回 localStorage，
+        // 否则 createClient 会立刻用旧 refresh_token 去刷新而触发令牌复用吊销
+        try { injectNativeSessionBeforeInit(); } catch (e) { console.warn('注入原生会话异常：', e); }
         supabaseClient = window.supabase
           ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
           : null;
@@ -718,7 +721,8 @@ const store = {
             }
           });
         }
-        // 若原生侧（小组件续期后）持有更新的会话，先采纳它，避免旧 refresh_token 被复用
+        // 兜底：本地完全没有会话（例如刚装 APK）但原生侧有 token 时，
+        // 用 setSession 把原生会话恢复出来。已在上面注入成功的话这里是空操作。
         try { await adoptNativeSession(); } catch (e) { console.warn('采纳原生会话异常：', e); }
         // 恢复已有会话；弱网下最多等 8 秒，超时不阻塞界面，交给上面的订阅兜底
         const res = await withTimeout(supabaseClient.auth.getSession(), 8000);
@@ -1633,6 +1637,8 @@ async function adoptNativeSession() {
   const nowSec = Math.floor(Date.now() / 1000);
   // 原生侧也过期的话就没有采纳价值，交给下面的正常恢复流程
   if (!nat.expires_at || Number(nat.expires_at) < nowSec + 30) return false;
+  // 本地已经是同一个 token（说明下面的注入已经生效），不用再走一次 setSession
+  if (readRawSession() && readRawSession().access_token === nat.access_token) return false;
   try {
     await supabaseClient.auth.setSession({
       access_token: nat.access_token,
@@ -1641,6 +1647,53 @@ async function adoptNativeSession() {
     return true;
   } catch (e) {
     console.warn('采纳原生会话失败，回退到本地会话：', e);
+    return false;
+  }
+}
+/* 读取 supabase-js 存在 localStorage 里的会话（原始结构，形如
+   {access_token, refresh_token, expires_at, user, ...}）。读不到就返回 null。 */
+function readRawSession() {
+  try {
+    const host = String(SUPABASE_URL).replace(/^https?:\/\//i, '').split('/')[0];
+    const key = 'sb-' + host.split('.')[0] + '-auth-token';
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object' && obj.access_token) ? obj : null;
+  } catch (e) { return null; }
+}
+/* 【关键】必须在 createClient() 之前调用。
+   supabase-js 一被创建就会立刻尝试恢复会话，而只要本地 access_token 已过期，
+   它就会拿本地那份 refresh_token 去刷新。小组件在 App 关闭期间早已把该 token
+   轮换掉，于是 GoTrue 判定「令牌复用」并吊销整个会话 —— 表现为网页端被登出、
+   小组件随后显示「请先在 App 中登录」。所以要在 createClient 之前，
+   把原生侧保存的新会话直接写回 localStorage，让它拿到的是最新 token。 */
+function injectNativeSessionBeforeInit() {
+  const bridge = window.AndroidBridge;
+  if (!bridge || typeof bridge.getStoredSession !== 'function') return false;
+  let raw = '';
+  try { raw = bridge.getStoredSession() || ''; } catch (e) { return false; }
+  if (!raw) return false;
+  let nat = null;
+  try { nat = JSON.parse(raw); } catch (e) { return false; }
+  if (!nat || !nat.access_token || !nat.refresh_token) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!nat.expires_at || Number(nat.expires_at) < nowSec + 30) return false;
+  // 只改本地已有的会话结构；认不出来就放弃，绝不自己造一份
+  const cur = readRawSession();
+  if (!cur) return false;
+  if ((Number(cur.expires_at) || 0) >= Number(nat.expires_at)) return false; // 本地更新，无需插手
+  cur.access_token = nat.access_token;
+  cur.refresh_token = nat.refresh_token;
+  cur.expires_at = Number(nat.expires_at);
+  try {
+    const host = String(SUPABASE_URL).replace(/^https?:\/\//i, '').split('/')[0];
+    const key = 'sb-' + host.split('.')[0] + '-auth-token';
+    localStorage.setItem(key, JSON.stringify(cur));
+    console.log('已用原生会话刷新本地 token（避免旧 refresh_token 被复用）');
+    return true;
+  } catch (e) {
+    console.warn('写回原生会话失败：', e);
     return false;
   }
 }
