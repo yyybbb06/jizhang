@@ -577,8 +577,17 @@ let authMode = 'login';      // 登录页模式：login | register
 let pendingSessionRecovery = false; // 会话恢复超时中（等 onAuthStateChange 兜底）
 let recoveryTimer = null;
 let storeReady = false;             // store.init() 是否已完成
+let bootError = '';                 // 启动阶段的诊断信息（显示在「关于与存储状态」里）
 let charts = {};             // 图表实例缓存
 let toastTimer = null;
+
+/* 记录启动阶段的错误，显示到「关于与存储状态」卡片上。
+   真机上没法看控制台，这样用户截个图就能定位。 */
+function noteBootError(label, err) {
+  const msg = label + ((err && err.message) ? '：' + err.message : '');
+  bootError = bootError ? (bootError + '；' + msg) : msg;
+  console.warn('[启动诊断] ' + msg, err || '');
+}
 
 /* 会话恢复兜底定时器：万一 onAuthStateChange 迟迟不给结果，
    到点仍无会话就按未登录处理，避免用户卡在一个空白界面里。 */
@@ -1635,18 +1644,24 @@ async function adoptNativeSession() {
   try { nat = JSON.parse(raw); } catch (e) { return false; }
   if (!nat || !nat.access_token || !nat.refresh_token) return false;
   const nowSec = Math.floor(Date.now() / 1000);
-  // 原生侧也过期的话就没有采纳价值，交给下面的正常恢复流程
+  // 原生侧也过期的话就没有采纳价值，交给正常的恢复流程
   if (!nat.expires_at || Number(nat.expires_at) < nowSec + 30) return false;
-  // 本地已经是同一个 token（说明下面的注入已经生效），不用再走一次 setSession
-  if (readRawSession() && readRawSession().access_token === nat.access_token) return false;
+  // 【关键】本地只要已有会话就一律不插手。
+  // 之前这里只判断「原生 token 未过期」，于是会拿原生侧的**旧** token 覆盖本地的新 token；
+  // 而 setSession 一旦失败，supabase-js 内部会清空会话并抛 SIGNED_OUT ——
+  // 等于把用户直接踢下线。这正是「用几天就被要求重新登录」的来源。
+  // 「原生侧更新」那种情况已经由上面的 injectNativeSessionBeforeInit() 处理了。
+  if (readRawSession()) return false;
   try {
-    await supabaseClient.auth.setSession({
+    // 必须加超时：setSession 会发网络请求，弱网下可能长时间挂起。
+    // 它是在 store.init() 里被 await 的，一旦挂住整个界面就永远停在「正在检测…」。
+    const r = await withTimeout(supabaseClient.auth.setSession({
       access_token: nat.access_token,
       refresh_token: nat.refresh_token,
-    });
-    return true;
+    }), 8000);
+    return r !== TIMEOUT;
   } catch (e) {
-    console.warn('采纳原生会话失败，回退到本地会话：', e);
+    console.warn('采纳原生会话失败：', e);
     return false;
   }
 }
@@ -1823,6 +1838,12 @@ function renderStorageStatus() {
       : '未配置 Supabase，数据保存在浏览器 localStorage 中。';
     note.style.display = 'none';
   }
+  // 启动阶段出过问题就把原因直接摆出来，方便用户截图定位
+  if (bootError) {
+    pill.textContent = '启动异常';
+    pill.classList.add('off');
+    desc.textContent = '⚠️ ' + bootError;
+  }
   renderAccountCard();
 }
 
@@ -1945,10 +1966,35 @@ async function init() {
   // 初始化记账表单（默认支出类别网格，首次打开即显示）
   resetForm();
   // 先渲染界面主体，避免网络慢时整页停在占位状态（「正在检测…」「未登录」）
-  renderShell();
-  // 初始化存储
-  await store.init();
+  try { renderShell(); } catch (e) { noteBootError('渲染界面失败', e); }
+  // 初始化存储：整体再加一层超时兜底。
+  // 界面能否从「正在检测…」翻篇，取决于 store.init() 是否返回；这里保证它一定返回。
+  let storePromise = null;
+  let storeRes = null;
+  try {
+    storePromise = store.init();
+    storeRes = await withTimeout(storePromise, 25000);
+  } catch (e) {
+    noteBootError('存储初始化异常', e);
+  }
   storeReady = true;
+  if (storeRes === TIMEOUT) {
+    // 超时绝不能掉进下面的「本地存储」分支——那会显示一份空数据，比等着更糟。
+    // store.init() 其实还在后台继续跑，它一完成就补渲染。
+    noteBootError('存储初始化超时（25 秒）', null);
+    hideAuth();
+    renderAll();
+    showToast('⏳ 云端连接较慢，恢复完成后会自动刷新');
+    Promise.resolve(storePromise).then(async () => {
+      storeReady = true;
+      if (store.isSupabase()) {
+        if (sessionUser) { hideAuth(); await refreshData().catch(() => {}); }
+        else { showAuth(); switchAuthTabs('login'); }
+      }
+      renderAll();
+    }).catch(() => {});
+    return;
+  }
   if (store.isSupabase()) {
     if (sessionUser) {
       // 已登录
