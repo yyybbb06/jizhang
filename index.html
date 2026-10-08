@@ -554,6 +554,11 @@ input::placeholder{color:var(--text-3)}
 const SUPABASE_URL = 'https://ddaosakqwrhhpjoplocl.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_0L5xb99yAoshdHFjnvIc0Q_TeAJsd_k';
 
+/* 页面版本戳：显示在「关于与存储状态」里。
+   真机上看不到控制台，有这个戳就能一眼确认手机上跑的是哪一版，
+   不用再靠猜（之前几轮排查一直卡在「你装的到底是不是最新版」上）。 */
+const APP_BUILD = '2026-10-08';
+
 const STORAGE_RECORDS_KEY = 'finance_records';
 const STORAGE_BUDGETS_KEY = 'finance_budgets';
 const SEED_FLAG_KEY = 'finance_seeded';
@@ -579,6 +584,7 @@ let sessionPending = false;         // 本地有会话，但还没跟云端确�
 let recoveryTimer = null;
 let storeReady = false;             // store.init() 是否已完成
 let bootError = '';                 // 启动阶段的诊断信息（显示在「关于与存储状态」里）
+let lastNetCheck = '';              // 最近一次网络自检结论
 let charts = {};             // 图表实例缓存
 let toastTimer = null;
 
@@ -762,6 +768,8 @@ const store = {
             pendingSessionRecovery = true;
             sessionUser = null;
             armRecoveryFallback();
+            // 顺手做一次网络自检，把原因留在「关于与存储状态」里
+            networkSelfCheck().catch(() => {});
           }
         } else {
           const sessionData = (res && res.data) ? res.data : {};
@@ -1660,6 +1668,28 @@ function friendlyAuthError(raw) {
   if (/timeout|timed out/i.test(m)) return '连接超时，请检查网络后重试';
   return m || '操作失败，请重试';
 }
+
+/* 网络自检：联网操作失败时跑一次，把「到底是云端不可达，还是别的原因」写进界面。
+   真机上没法看控制台，这一步能把排障信息直接摆到用户面前。 */
+async function networkSelfCheck() {
+  const t0 = Date.now();
+  try {
+    const r = await withTimeout(
+      fetch(SUPABASE_URL + '/auth/v1/health', { headers: { apikey: SUPABASE_ANON_KEY } }),
+      12000
+    );
+    const cost = Date.now() - t0;
+    if (r === TIMEOUT) { lastNetCheck = '云端自检：超时（12 秒无响应）'; }
+    else if (r && r.ok) { lastNetCheck = '云端自检：可达（' + cost + 'ms）'; }
+    else { lastNetCheck = '云端自检：返回 HTTP ' + (r ? r.status : '?') + '（' + cost + 'ms）'; }
+  } catch (e) {
+    const cost = Date.now() - t0;
+    lastNetCheck = '云端自检：不可达（' + ((e && e.message) || '未知错误') + '，' + cost + 'ms）';
+  }
+  console.warn('[网络自检] ' + lastNetCheck);
+  try { if (storeReady) renderStorageStatus(); } catch (e) {}
+  return lastNetCheck;
+}
 /* 原生 App（Android 小组件）会话桥
    把 access_token / refresh_token / expires_at 一并同步给原生侧，
    使小组件在 token 过期后能自行续期，无需用户打开 App。
@@ -1820,7 +1850,10 @@ async function handleAuthSubmit(e) {
     showToast('✅ 欢迎，' + (sessionUser.email || sessionUser.id) + (bridgeOk ? '（手机组件已连接）' : ''));
   } catch (err) {
     console.error(err);
-    showAuthError(friendlyAuthError(err.message));
+    const friendly = friendlyAuthError(err.message);
+    showAuthError(friendly);
+    // 登录失败时顺手做一次网络自检，把「云端到底可不可达」写清楚
+    networkSelfCheck().then(s => showAuthError(friendly + '（' + s + '）'));
   } finally {
     btn.disabled = false;
     btn.textContent = authMode === 'login' ? '登录' : '注册';
@@ -1919,6 +1952,10 @@ function renderStorageStatus() {
     pill.classList.add('off');
     desc.textContent = '⚠️ ' + bootError;
   }
+  if (lastNetCheck) {
+    desc.textContent = (desc.textContent ? desc.textContent + ' ' : '') + lastNetCheck;
+  }
+  desc.textContent = (desc.textContent ? desc.textContent + ' ' : '') + '（页面版本 ' + APP_BUILD + '）';
   renderAccountCard();
 }
 
