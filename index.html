@@ -575,6 +575,7 @@ let supabaseClient = null;
 let sessionUser = null;      // 当前用户：Supabase 用户对象 / 'local'
 let authMode = 'login';      // 登录页模式：login | register
 let pendingSessionRecovery = false; // 会话恢复超时中（等 onAuthStateChange 兜底）
+let sessionPending = false;         // 本地有会话，但还没跟云端确认（离线优先渲染用）
 let recoveryTimer = null;
 let storeReady = false;             // store.init() 是否已完成
 let bootError = '';                 // 启动阶段的诊断信息（显示在「关于与存储状态」里）
@@ -596,6 +597,12 @@ function armRecoveryFallback() {
   recoveryTimer = setTimeout(() => {
     if (!pendingSessionRecovery) return;
     pendingSessionRecovery = false;
+    // 本地还有会话 → 只切到离线模式，绝不能弹登录页（网络慢不等于未登录）
+    if (!sessionUser && readRawSession()) {
+      sessionPending = true;
+      renderAll();
+      return;
+    }
     if (!sessionUser) {
       showAuth();
       switchAuthTabs('login');
@@ -712,16 +719,22 @@ const store = {
           supabaseClient.auth.onAuthStateChange((event, session) => {
             if (session) {
               sessionUser = session.user;
+              const wasUnconfirmed = pendingSessionRecovery || sessionPending;
+              pendingSessionRecovery = false;
+              sessionPending = false;
               notifyNativeSession(session);
-              if (pendingSessionRecovery) {
-                pendingSessionRecovery = false;
+              if (wasUnconfirmed) {
                 hideAuth();
                 refreshData().catch(e => console.warn('恢复会话后刷新失败：', e));
                 renderAccountCard();
               }
             } else if (event === 'SIGNED_OUT') {
               sessionUser = null;
+              sessionPending = false;
+              pendingSessionRecovery = false;
               notifyNativeSession(null);
+              // 只有本地会话确实被清掉了才弹登录页，避免弱网下误判把用户赶下线
+              if (storeReady && !readRawSession()) { showAuth(); switchAuthTabs('login'); }
             } else if (event === 'INITIAL_SESSION' && pendingSessionRecovery) {
               // Supabase 明确告知「没有会话」，这时才弹登录页
               pendingSessionRecovery = false;
@@ -733,13 +746,23 @@ const store = {
         // 兜底：本地完全没有会话（例如刚装 APK）但原生侧有 token 时，
         // 用 setSession 把原生会话恢复出来。已在上面注入成功的话这里是空操作。
         try { await adoptNativeSession(); } catch (e) { console.warn('采纳原生会话异常：', e); }
-        // 恢复已有会话；弱网下最多等 8 秒，超时不阻塞界面，交给上面的订阅兜底
+        // 恢复已有会话；弱网下最多等 8 秒
         const res = await withTimeout(supabaseClient.auth.getSession(), 8000);
         if (res === TIMEOUT) {
-          console.warn('恢复会话超时，先渲染界面，等 onAuthStateChange 补会话');
-          pendingSessionRecovery = true;
-          sessionUser = null;
-          armRecoveryFallback();
+          // 【关键】超时 ≠ 未登录。只要 localStorage 里还有会话，就按「未确认」处理，
+          // 让界面立刻用缓存渲染出来，真正的状态交给后台 onAuthStateChange 决定。
+          // 之前这里一律当作 pendingSessionRecovery，20 秒后弹登录页 ——
+          // 结果就是「网络一慢就被要求重新登录」。
+          if (readRawSession()) {
+            console.warn('会话确认超时，但本地有会话：按离线模式先渲染');
+            sessionPending = true;
+            sessionUser = null;
+          } else {
+            console.warn('恢复会话超时且本地无会话，等 onAuthStateChange 兜底');
+            pendingSessionRecovery = true;
+            sessionUser = null;
+            armRecoveryFallback();
+          }
         } else {
           const sessionData = (res && res.data) ? res.data : {};
           if (sessionData.session) {
@@ -861,15 +884,50 @@ function persistLocal() {
 }
 
 /* ===================== 数据刷新 ===================== */
+/* 本机数据缓存：网络不可用时靠它把界面撑起来。
+   注意用独立的 key，不要和「本地模式」的 finance_records 混用。 */
+const CACHE_RECORDS_KEY = 'finance_cache_records';
+const CACHE_BUDGETS_KEY = 'finance_cache_budgets';
+const CACHE_AT_KEY = 'finance_cache_at';
+
+function saveDataCache() {
+  try {
+    localStorage.setItem(CACHE_RECORDS_KEY, JSON.stringify(records || []));
+    localStorage.setItem(CACHE_BUDGETS_KEY, JSON.stringify(budgets || []));
+    localStorage.setItem(CACHE_AT_KEY, String(Date.now()));
+  } catch (e) { /* 配额满等情况忽略即可，缓存不是关键路径 */ }
+}
+function loadDataCache() {
+  try {
+    const r = JSON.parse(localStorage.getItem(CACHE_RECORDS_KEY) || '[]');
+    const b = JSON.parse(localStorage.getItem(CACHE_BUDGETS_KEY) || '[]');
+    if (Array.isArray(r) && r.length) records = r;
+    if (Array.isArray(b) && b.length) budgets = b;
+    return Array.isArray(r) && r.length > 0;
+  } catch (e) { return false; }
+}
+function cacheAgeLabel() {
+  try {
+    const ts = Number(localStorage.getItem(CACHE_AT_KEY) || 0);
+    if (!ts) return '';
+    const d = new Date(ts);
+    const sameDay = toDateStr(d) === todayStr();
+    const hhmm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    return sameDay ? hhmm : (pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + hhmm);
+  } catch (e) { return ''; }
+}
+
 async function refreshData() {
   try {
     records = await store.loadRecords();
     budgets = await store.loadBudgets();
+    saveDataCache();          // 成功后落缓存，下次冷启动可以秒出
   } catch (e) {
     console.error('加载数据失败：', e);
-    showToast('⚠️ 数据加载失败：' + (e.message || '未知错误'));
-    records = [];
-    budgets = [];
+    // 关键：失败时**不要**把 records/budgets 清空。
+    // 之前这里直接置空，于是一次网络抖动就表现为「账本空了」，比报错更吓人。
+    if (records.length === 0) loadDataCache();
+    showToast('⚠️ 暂时无法同步，正在显示本机缓存');
   }
   renderAll();
 }
@@ -1594,6 +1652,12 @@ function friendlyAuthError(raw) {
   if (m.includes('Password should be at least')) return '密码至少需要 6 位';
   if (m.includes('Email not confirmed')) return '邮箱尚未验证，请先到邮箱点击确认链接';
   if (m.includes('Anonymous sign-ins are disabled')) return '项目未开启匿名登录';
+  // 网络层失败：fetch 压根没拿到响应（断网 / DNS / TLS / 被中间设备拦截）都会落到这里。
+  // 原来直接把英文 Failed to fetch 抛给用户，看不出是网络问题还是密码问题。
+  if (/Failed to fetch|NetworkError|Load failed|Network request failed|ERR_/i.test(m)) {
+    return '网络连接失败：云端地址访问不到，请检查网络后重试';
+  }
+  if (/timeout|timed out/i.test(m)) return '连接超时，请检查网络后重试';
   return m || '操作失败，请重试';
 }
 /* 原生 App（Android 小组件）会话桥
@@ -1793,6 +1857,13 @@ function renderAccountCard() {
     btn.onclick = null;
     return;
   }
+  if (sessionPending) {
+    name.textContent = '离线模式';
+    desc.textContent = '网络较慢，正在用本机缓存显示；恢复连接后会自动同步';
+    btn.textContent = '重新登录';
+    btn.onclick = () => { switchAuthTabs('login'); showAuth(); };
+    return;
+  }
   if (pendingSessionRecovery) {
     name.textContent = '正在恢复登录状态…';
     desc.textContent = '网络较慢，正在向云端确认会话；若长时间无响应请重新登录';
@@ -1821,7 +1892,11 @@ function renderStorageStatus() {
   if (useSupabase) {
     pill.textContent = 'Supabase 云存储';
     pill.classList.remove('off');
-    if (pendingSessionRecovery) {
+    if (sessionPending) {
+      const age = cacheAgeLabel();
+      desc.textContent = '离线模式：暂用本机缓存显示' +
+        (age ? '（数据截至 ' + age + '）' : '') + '，恢复连接后会自动同步。';
+    } else if (pendingSessionRecovery) {
       desc.textContent = '正在向云端确认登录状态，请稍候…';
     } else {
       desc.textContent = sessionUser
@@ -1965,7 +2040,9 @@ async function init() {
   document.getElementById('budgetAmount').value = existingBudget ? existingBudget.budget : '';
   // 初始化记账表单（默认支出类别网格，首次打开即显示）
   resetForm();
-  // 先渲染界面主体，避免网络慢时整页停在占位状态（「正在检测…」「未登录」）
+  // 先把本机缓存读进来，配合 renderShell() 让界面在离线时也有内容可看
+  try { loadDataCache(); } catch (e) { console.warn('读取本机缓存失败：', e); }
+  // 再渲染界面主体，避免网络慢时整页停在占位状态（「正在检测…」「未登录」）
   try { renderShell(); } catch (e) { noteBootError('渲染界面失败', e); }
   // 初始化存储：整体再加一层超时兜底。
   // 界面能否从「正在检测…」翻篇，取决于 store.init() 是否返回；这里保证它一定返回。
@@ -1989,7 +2066,8 @@ async function init() {
       storeReady = true;
       if (store.isSupabase()) {
         if (sessionUser) { hideAuth(); await refreshData().catch(() => {}); }
-        else { showAuth(); switchAuthTabs('login'); }
+        // 本地还有会话就绝不弹登录页：网络慢不等于未登录
+        else if (!readRawSession()) { showAuth(); switchAuthTabs('login'); }
       }
       renderAll();
     }).catch(() => {});
@@ -2000,6 +2078,13 @@ async function init() {
       // 已登录
       hideAuth();
       await refreshData();
+    } else if (sessionPending) {
+      // 本地有会话但还没跟云端确认：立刻用本机缓存把界面撑起来，
+      // 不要让用户对着「正在恢复登录状态…」干等。确认成功后会自动补拉数据。
+      hideAuth();
+      renderAll();
+      console.log('记账工作台：离线优先渲染，等待云端确认会话');
+      return;
     } else if (pendingSessionRecovery) {
       // 会话还在恢复中：先让用户进得去，恢复成功后自动隐藏登录页并拉数据
       hideAuth();
