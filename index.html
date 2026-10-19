@@ -557,7 +557,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_0L5xb99yAoshdHFjnvIc0Q_TeAJsd_k';
 /* 页面版本戳：显示在「关于与存储状态」里。
    真机上看不到控制台，有这个戳就能一眼确认手机上跑的是哪一版，
    不用再靠猜（之前几轮排查一直卡在「你装的到底是不是最新版」上）。 */
-const APP_BUILD = '2026-10-08';
+const APP_BUILD = '2026-10-19';
 
 const STORAGE_RECORDS_KEY = 'finance_records';
 const STORAGE_BUDGETS_KEY = 'finance_budgets';
@@ -738,9 +738,13 @@ const store = {
               sessionUser = null;
               sessionPending = false;
               pendingSessionRecovery = false;
-              notifyNativeSession(null);
-              // 只有本地会话确实被清掉了才弹登录页，避免弱网下误判把用户赶下线
-              if (storeReady && !readRawSession()) { showAuth(); switchAuthTabs('login'); }
+              if (!storeReady) { notifyNativeSession(null); return; }
+              // 本地还有会话就不弹登录页（弱网误判的情况）
+              if (readRawSession()) { notifyNativeSession(null); return; }
+              // 【关键】这里不能先 notifyNativeSession(null) —— 那会把原生会话也清掉，
+              // 而原生侧（小组件一直用 refresh_token 自行续期）往往还握着有效 token。
+              // 所以先在 recoverSessionFromNative() 里试着自救，失败后才清。
+              recoverSessionFromNative();
             } else if (event === 'INITIAL_SESSION' && pendingSessionRecovery) {
               // Supabase 明确告知「没有会话」，这时才弹登录页
               pendingSessionRecovery = false;
@@ -1758,6 +1762,45 @@ async function adoptNativeSession() {
     console.warn('采纳原生会话失败：', e);
     return false;
   }
+}
+/* 会话被云端判死时的自救。
+   小组件在 App 关闭期间会持续用 refresh_token 续期，原生侧那份通常比 WebView 的更新；
+   所以先试着用它把会话恢复出来，避免用户被迫重新登录。
+   10 分钟内最多尝试 3 次，防止 setSession 反复失败时陷入死循环。 */
+let authRecoveryCount = 0;
+let authRecoveryWindowStart = 0;
+function recoverSessionFromNative() {
+  const now = Date.now();
+  if (now - authRecoveryWindowStart > 10 * 60 * 1000) {
+    authRecoveryWindowStart = now;
+    authRecoveryCount = 0;
+  }
+  if (authRecoveryCount >= 3) {
+    console.warn('原生会话自救次数已达上限，要求重新登录');
+    notifyNativeSession(null);
+    showAuth();
+    switchAuthTabs('login');
+    return;
+  }
+  authRecoveryCount++;
+  console.log('尝试从原生侧恢复会话，第 ' + authRecoveryCount + ' 次');
+  Promise.resolve(adoptNativeSession()).then(ok => {
+    if (ok) {
+      console.log('已从原生侧恢复会话');
+      hideAuth();
+      refreshData().catch(() => {});
+      renderAll();
+    } else {
+      // 自救失败，这时才真正清掉原生会话
+      notifyNativeSession(null);
+      showAuth();
+      switchAuthTabs('login');
+    }
+  }).catch(() => {
+    notifyNativeSession(null);
+    showAuth();
+    switchAuthTabs('login');
+  });
 }
 /* 读取 supabase-js 存在 localStorage 里的会话（原始结构，形如
    {access_token, refresh_token, expires_at, user, ...}）。读不到就返回 null。 */
