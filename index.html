@@ -557,7 +557,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_0L5xb99yAoshdHFjnvIc0Q_TeAJsd_k';
 /* 页面版本戳：显示在「关于与存储状态」里。
    真机上看不到控制台，有这个戳就能一眼确认手机上跑的是哪一版，
    不用再靠猜（之前几轮排查一直卡在「你装的到底是不是最新版」上）。 */
-const APP_BUILD = '2026-10-19';
+const APP_BUILD = '2026-11-06';
 
 const STORAGE_RECORDS_KEY = 'finance_records';
 const STORAGE_BUDGETS_KEY = 'finance_budgets';
@@ -738,9 +738,17 @@ const store = {
               sessionUser = null;
               sessionPending = false;
               pendingSessionRecovery = false;
-              if (!storeReady) { notifyNativeSession(null); return; }
-              // 本地还有会话就不弹登录页（弱网误判的情况）
-              if (readRawSession()) { notifyNativeSession(null); return; }
+              // 启动还没完成时判断不了真实状态，先不要动原生会话（清掉就再也救不回来）
+              if (!storeReady) return;
+              // 本地还有会话 → 不弹登录页，也不清原生会话；
+              // 顺手把本地这份补推给原生侧，小组件可能正缺一份新的。
+              if (readRawSession()) {
+                Promise.resolve(supabaseClient.auth.getSession()).then(r => {
+                  const s = r && r.data && r.data.session;
+                  if (s) notifyNativeSession(s);
+                }).catch(() => {});
+                return;
+              }
               // 【关键】这里不能先 notifyNativeSession(null) —— 那会把原生会话也清掉，
               // 而原生侧（小组件一直用 refresh_token 自行续期）往往还握着有效 token。
               // 所以先在 recoverSessionFromNative() 里试着自救，失败后才清。
