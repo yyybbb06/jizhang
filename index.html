@@ -557,7 +557,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_0L5xb99yAoshdHFjnvIc0Q_TeAJsd_k';
 /* 页面版本戳：显示在「关于与存储状态」里。
    真机上看不到控制台，有这个戳就能一眼确认手机上跑的是哪一版，
    不用再靠猜（之前几轮排查一直卡在「你装的到底是不是最新版」上）。 */
-const APP_BUILD = '2026-11-17.1';
+const APP_BUILD = '2026-11-17.2';
 
 const STORAGE_RECORDS_KEY = 'finance_records';
 const STORAGE_BUDGETS_KEY = 'finance_budgets';
@@ -711,34 +711,29 @@ const store = {
   async init() {
     if (SUPABASE_URL && SUPABASE_ANON_KEY) {
       try {
-        // 【顺序关键】必须在 createClient() **之前**拿到原生会话。
-        // supabase-js 一被创建就立刻读 storage 恢复会话；如果读到的是旧
-        // refresh_token，它会自己去轮换 —— 而那个 token 早被小组件换掉了。
+        // 【顺序关键】原生模式下先让原生把会话准备好（临期则先续一次）。
+        // 之后 createClient() 会通过 NativeAuthStorage 读原生存储 —— 拿到的
+        // 一定是新鲜会话，supabase-js 因此不会自己发起任何刷新。
         let nativeBootOk = false;
         if (NATIVE_SHELL) {
-          try { nativeBootOk = !!syncNativeSession('fresh', 'boot'); }
+          try { nativeBootOk = !!window.AndroidBridge.getFreshSession(); }
           catch (e) { console.warn('引导原生会话异常：', e); }
-          // 老用户升级上来时本地 expires_at 是真实值，统一加余量，
-          // 让 supabase-js 不再自行判定过期而偷偷发起刷新
-          try { normalizeLocalSessionExpiry(); } catch (e) {}
-          // 【对齐两边】原生侧那份可能是旧的（例如用户上次是在浏览器里登录、
-          // 或者小组件很久没跑）。把本地这份推上去，交给原生做单调判断：
-          // 本地更新才会被接受，旧的一方永远不会覆盖新的一方。
-          try {
-            const localRaw = readRawSession();
-            if (localRaw) notifyNativeSession(localRaw);
-          } catch (e) {}
+          refreshSecurityState();
         }
+        // 认证选项按环境分流；storage 只在原生模式下替换
+        const authOptions = {
+          persistSession: true,
+          // 原生模式：刷新权交给 Android SessionManager（全局单飞）
+          // 浏览器：保持原来的自动刷新，不受 Android 改造影响
+          autoRefreshToken: !NATIVE_SHELL,
+          detectSessionInUrl: !NATIVE_SHELL,
+          flowType: 'implicit',
+        };
+        if (NATIVE_SHELL) authOptions.storage = NativeAuthStorage;
+
         supabaseClient = window.supabase
           ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-              auth: {
-                persistSession: true,
-                // 原生模式：刷新权交给 Android SessionManager（全局单飞），
-                // 浏览器：保持原来的自动刷新，不受 Android 改造影响
-                autoRefreshToken: !NATIVE_SHELL,
-                detectSessionInUrl: !NATIVE_SHELL,
-                flowType: 'implicit',
-              },
+              auth: authOptions,
               // 仅原生模式接管 fetch：401 时先向原生要新 token 再重试一次
               global: NATIVE_SHELL ? { fetch: nativeAwareFetch } : {},
             })
@@ -764,11 +759,17 @@ const store = {
               sessionUser = null;
               sessionPending = false;
               pendingSessionRecovery = false;
+              // 【主动退出】用户点了"退出登录"：绝不走自救，否则立刻又登回去。
+              // 真正的清理在 signOutAccount() 的 finally 里统一做。
+              if (isExplicitSigningOut) {
+                console.log('[会话] 主动退出中，跳过原生会话恢复');
+                return;
+              }
               // 启动还没完成时判断不了真实状态，先不要动原生会话（清掉就再也救不回来）
               if (!storeReady) return;
               // 【原生模式】supabase 把本地会话清掉 ≠ 用户真的登出。
               // 小组件一直在用 refresh_token 续期，原生侧往往还握着有效会话，
-              // 先从原生同步回来；救不回来才弹登录页（且不清原生会话）。
+              // 重新读一次即可恢复；救不回来才弹登录页（且不清原生会话）。
               if (NATIVE_SHELL) {
                 recoverSessionFromNative();
                 return;
@@ -793,10 +794,9 @@ const store = {
             }
           });
         }
-        // 原生会话已在 createClient() 之前同步进 localStorage，这里**不再**调
-        // setSession()：它会多打一次 /user 请求，且 token 过期时会自己轮换
-        // refresh_token，在原生模式下会引发重复刷新。
-        if (NATIVE_SHELL) console.log('Android 原生会话模式：' + (nativeBootOk ? '已注入原生会话' : '原生侧暂无会话'));
+        // 原生模式下会话由 NativeAuthStorage 托管，这里**不再**调 setSession()：
+        // 它会多打一次 /user 请求，且 token 过期时会自己轮换 refresh_token。
+        if (NATIVE_SHELL) console.log('Android 原生会话模式：' + (nativeBootOk ? '原生侧有会话' : '原生侧暂无会话'));
         // 恢复已有会话；弱网下最多等 8 秒
         const res = await withTimeout(supabaseClient.auth.getSession(), 8000);
         if (res === TIMEOUT) {
@@ -1754,55 +1754,110 @@ async function networkSelfCheck() {
  * 运行时分流，两种模式共用同一份 HTML：
  *
  *   普通浏览器  → supabase-js 自己 persistSession + autoRefreshToken（原样保留）
- *   Android APK → 原生 SessionManager 独占刷新，supabase-js 只消费会话
+ *   Android APK → supabase-js 的存储被换成原生（Keystore 加密），刷新由原生独占
  *
- * 为什么要分流：Supabase 开着 refresh token rotation。WebView 与桌面小组件
- * 各自拿同一个 refresh_token 去续期时，后刷新的一方必然拿到
- * refresh_token_already_used（GoTrue 视为令牌复用，可能吊销整个会话族），
- * 表现就是「用几小时被要求重新登录」。
+ * 三件事必须一起成立，缺一个都会退回"用几小时掉登录"：
  *
- * 实现要点（对应 supabase-js 2.112.3 的真实行为，换版本前请重新核对）：
+ *  1. **refresh_token 只能有一份、且只能是原生那份。**
+ *     supabase-js 支持自定义 `auth.storage`（`getItem/setItem/removeItem`，
+ *     可以同步返回）。Android 模式下把这三个方法接到 `AndroidBridge`，
+ *     读写全部落到 Keystore 加密的 SessionManager —— 页面的 localStorage 里
+ *     **不再保存任何 token**。这样既解决了明文落盘（问题三），也顺带消灭了
+ *     "WebView 和原生各存一份、互相覆盖"的整个问题族。
  *
- *  1. `auth.__loadSession()`（getSession() 走的就是它）只要发现 expires_at
- *     已到期，**不管 autoRefreshToken 是不是 false**，都会调用
- *     `_callRefreshToken()` 去轮换 refresh_token。所以「只关掉自动刷新」
- *     拦不住这种隐式刷新。对策：本层写进 localStorage 的 expires_at 统一加
- *     NATIVE_EXP_GRACE 秒余量，真实过期时间另存一份（finance_native_token_exp），
- *     由保活定时器盯着。这样 supabase-js 永远不会自己发起刷新。
+ *  2. **supabase-js 永远不自己刷新。**
+ *     `__loadSession()` 只要 `expires_at` 到期，不管 `autoRefreshToken` 是否为
+ *     false 都会调 `_callRefreshToken()`。所以原生返回的 `expires_at` 统一加了
+ *     30 分钟余量（见 SessionManager.STORAGE_EXP_GRACE_SEC），真实过期由原生自己盯。
+ *     真实过期真的到了（离线很久），请求会 401，由 nativeAwareFetch 兜底。
  *
- *  2. 反过来，如果任由 supabase-js 拿着过期 token，它在 `_callRefreshToken()`
- *     失败后会执行 `_removeSession()` 把本地会话清空 → 直接弹登录页。
- *     这是旧版「网络一抖就被要求重新登录」的另一半原因。
- *
- *  3. 会话写回 localStorage 后，`getSession()` 每次都从 storage 重新读
- *     （不是内存缓存），所以**不需要**调 setSession()。setSession() 会多打一次
- *     /user 请求，而且 token 过期时它自己会去轮换 refresh_token ——
- *     在原生模式下绝对不能碰。
+ *  3. **`removeItem` 不能转发给原生。**
+ *     supabase 在 refresh 失败、会话判定失败等场景也会调它，那不代表原生会话
+ *     该被清掉（小组件还在用）。只有用户显式退出才走 `clearSession()`。
  */
 const NATIVE_SHELL = (function () {
   try {
     const b = window.AndroidBridge;
-    return !!(b && typeof b.getStoredSession === 'function');
+    // 新版桥才有 authStorageGet；只有旧桥的 APK 按浏览器模式跑
+    return !!(b && typeof b.authStorageGet === 'function');
   } catch (e) { return false; }
 })();
 
-/* 写进 localStorage 的 expires_at 比真实过期时间多留的秒数。
-   只影响 supabase-js "要不要自己刷新" 的判定，服务端仍按 JWT 的真实 exp 校验。 */
-const NATIVE_EXP_GRACE = 1800;
-/* 距真实过期不足该秒数就向原生要新 token（约每小时一次） */
-const NATIVE_SYNC_AHEAD = 900;
-const NATIVE_REAL_EXP_KEY = 'finance_native_token_exp';
-let nativeSyncBusy = false;
+/** 仅覆盖 signOut 过程：期间禁止把会话写回原生 / 触发自救 */
+let isExplicitSigningOut = false;
+/** 退出后的一小段时间内，忽略原生推送与自救（防止延迟回调把会话带回来） */
+let suppressNativeSessionUntil = 0;
 let nativeKeeperTimer = null;
+/** 原生安全存储状态：null=未知，true=正常，false=Keystore 不可用 */
+let nativeSecureStorageOk = null;
+
+/* 上一版遗留的键，启动/退出时顺手清掉 */
+const NATIVE_REAL_EXP_KEY = 'finance_native_token_exp';
 
 /* supabase-js 的存储键：sb-<project-ref>-auth-token */
 function authStorageKey() {
   const host = String(SUPABASE_URL).replace(/^https?:\/\//i, '').split('/')[0];
   return 'sb-' + host.split('.')[0] + '-auth-token';
 }
-/* 读取 supabase-js 存在 localStorage 里的会话（原始结构，
-   形如 {access_token, refresh_token, expires_at, user, ...}）。读不到返回 null。 */
+
+/* 解出 JWT payload（只读，不验签；只用来兜底拿 email / sub） */
+function jwtPayload(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return {};
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64 + '==='.slice((b64.length + 3) % 4);
+    return JSON.parse(decodeURIComponent(escape(atob(pad)))) || {};
+  } catch (e) { return {}; }
+}
+/* 从原生会话 JSON 里拼一个能用的 user 对象 */
+function nativeUser(nat) {
+  if (nat && nat.user_json) {
+    try { return JSON.parse(nat.user_json); } catch (e) { /* fallthrough */ }
+  }
+  const p = jwtPayload(nat && nat.access_token);
+  return {
+    id: (nat && nat.user_id) || p.sub || '',
+    email: (nat && nat.email) || p.email || '',
+    aud: 'authenticated',
+    role: 'authenticated',
+  };
+}
+
+/**
+ * supabase-js 自定义 storage。
+ *
+ * 读：同步调原生（Java 桥线程），返回的就是 supabase 期望的会话 JSON。
+ * 写在原生的 SessionManager 里是"单调合并"的：旧的会话推不进去。
+ */
+const NativeAuthStorage = {
+  getItem: function (key) {
+    if (!NATIVE_SHELL) return null;
+    if (key && key.length > 5 && key.slice(-5) === '-user') return null;
+    let raw = '';
+    try { raw = window.AndroidBridge.authStorageGet(key || '') || ''; } catch (e) { return null; }
+    return raw ? raw : null;
+  },
+  setItem: function (key, value) {
+    if (!NATIVE_SHELL) return;
+    if (isExplicitSigningOut) return;   // 退出过程中不允许写回
+    try { window.AndroidBridge.authStorageSet(key || '', value || ''); } catch (e) {}
+  },
+  removeItem: function (key) {
+    /* 故意什么都不做，见文件头第 3 条。 */
+  },
+};
+
+/* 读取本地会话（原始结构）。原生模式下问原生，浏览器模式读 localStorage。 */
 function readRawSession() {
+  if (NATIVE_SHELL) {
+    try {
+      const raw = window.AndroidBridge.getStoredSession() || '';
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      return (obj && obj.access_token) ? obj : null;
+    } catch (e) { return null; }
+  }
   try {
     const raw = localStorage.getItem(authStorageKey());
     if (!raw) return null;
@@ -1810,183 +1865,52 @@ function readRawSession() {
     return (obj && typeof obj === 'object' && obj.access_token) ? obj : null;
   } catch (e) { return null; }
 }
-/* 解出 JWT payload（只读，不验签；用于拿真实 exp 与 sub） */
-function jwtPayload(token) {
-  try {
-    const parts = String(token || '').split('.');
-    if (parts.length < 2) return {};
-    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const pad = b64 + '==='.slice((b64.length + 3) % 4);
-    const json = decodeURIComponent(escape(atob(pad)));
-    return JSON.parse(json) || {};
-  } catch (e) { return {}; }
-}
-function sessionRealExp(sess) {
-  if (!sess) return 0;
-  const p = jwtPayload(sess.access_token);
-  return Number(p.exp) || Number(sess.expires_at) || 0;
-}
 
-/* 调用原生会话接口。kind: 'stored' 只读 / 'fresh' 临期才刷 / 'force' 强制刷。
-   这些调用是同步的（@JavascriptInterface 返回值），最多阻塞到 SessionManager
-   内部超时（约 12 秒）；只在启动、临期、401 三种时刻发生。 */
-function callNativeSession(kind) {
-  const b = window.AndroidBridge;
-  if (!b) return null;
-  let raw = '';
+/* 强制让原生刷一次（401 兜底用）。返回新的 access_token 或 null。 */
+function nativeForceRefreshToken() {
+  if (!NATIVE_SHELL || isExplicitSigningOut) return null;
   try {
-    if (kind === 'force' && typeof b.refreshSession === 'function') {
-      raw = b.refreshSession() || '';
-    } else if (kind === 'fresh' && typeof b.getFreshSession === 'function') {
-      raw = b.getFreshSession() || '';
-    } else if (typeof b.getStoredSession === 'function') {
-      raw = b.getStoredSession() || '';
-    }
-  } catch (e) {
-    console.warn('调用原生会话接口失败：', e);
-    return null;
-  }
-  if (!raw) return null;
-  try {
+    const raw = window.AndroidBridge.refreshSession() || '';
+    if (!raw) return null;
     const nat = JSON.parse(raw);
-    if (!nat || !nat.access_token || !nat.refresh_token) return null;
-    return nat;
+    return (nat && nat.access_token) ? nat.access_token : null;
   } catch (e) { return null; }
 }
 
-/* 把原生会话写进 supabase-js 的存储。返回写入后的会话对象，失败返回 null。
-   单调保护：原生那份比本地旧就不覆盖（刚登录完时原生还没收到推送）。 */
-function applyNativeSession(nat) {
-  if (!nat || !NATIVE_SHELL) return null;
-  const payload = jwtPayload(nat.access_token);
-  const realExp = Number(payload.exp) || (Number(nat.expires_at) || 0);
-  if (!realExp) return null;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const cur = readRawSession();
-  if (cur) {
-    const curReal = Number(localStorage.getItem(NATIVE_REAL_EXP_KEY) || 0) || sessionRealExp(cur);
-    if (curReal && realExp < curReal) return null;   // 旧会话，丢弃
-  }
-  const uid = nat.user_id || payload.sub || '';
-  let user = null;
-  if (nat.user_json) {
-    try { user = JSON.parse(nat.user_json); } catch (e) { user = null; }
-  }
-  if (!user && cur && cur.user && (!uid || !cur.user.id || cur.user.id === uid)) user = cur.user;
-  if (!user) {
-    // 绝不能省：supabase-js 在没有 user 字段时会塞一个"一访问就抛错"的 Proxy，
-    // 页面上 sessionUser.email 会直接炸。所以这里必须给一个能用的 user 对象。
-    user = {
-      id: uid,
-      email: nat.email || payload.email || '',
-      aud: 'authenticated',
-      role: 'authenticated',
-    };
-  }
-  const sess = {
-    access_token: nat.access_token,
-    token_type: 'bearer',
-    expires_in: Math.max(0, realExp - nowSec),
-    expires_at: realExp + NATIVE_EXP_GRACE,
-    refresh_token: nat.refresh_token,
-    user: user,
-  };
-  try {
-    localStorage.setItem(authStorageKey(), JSON.stringify(sess));
-    localStorage.setItem(NATIVE_REAL_EXP_KEY, String(realExp));
-  } catch (e) {
-    console.warn('写入本地会话失败：', e);
-    return null;
-  }
-  return sess;
-}
-
-/* 同步原生会话 → localStorage。返回可用的 access_token，失败返回 null。 */
-function syncNativeSession(kind, reason) {
-  if (!NATIVE_SHELL) return null;
-  if (nativeSyncBusy) {
-    const cur = readRawSession();
-    return cur ? cur.access_token : null;
-  }
-  nativeSyncBusy = true;
-  try {
-    const nat = callNativeSession(kind || 'fresh');
-    if (!nat) return null;
-    const applied = applyNativeSession(nat);
-    if (!applied) return null;
-    if (!sessionUser && applied.user) {
-      sessionUser = applied.user;
-      sessionPending = false;
-      pendingSessionRecovery = false;
-    }
-    const remain = Math.max(0, Number(localStorage.getItem(NATIVE_REAL_EXP_KEY) || 0) - Math.floor(Date.now() / 1000));
-    console.log('[原生会话] 已同步（' + reason + '），真实剩余 ' + remain + 's');
-    return applied.access_token;
-  } finally {
-    nativeSyncBusy = false;
-  }
-}
-
-/* 老用户升级上来时，本地 expires_at 是真实值；统一加余量，
-   让 supabase-js 不再自己判定过期而发起刷新。 */
-function normalizeLocalSessionExpiry() {
-  if (!NATIVE_SHELL) return false;
-  const cur = readRawSession();
-  if (!cur) return false;
-  const realExp = sessionRealExp(cur);
-  if (!realExp) return false;
-  try { localStorage.setItem(NATIVE_REAL_EXP_KEY, String(realExp)); } catch (e) {}
-  const want = realExp + NATIVE_EXP_GRACE;
-  if (Number(cur.expires_at) === want) return true;
-  cur.expires_at = want;
-  cur.expires_in = Math.max(0, realExp - Math.floor(Date.now() / 1000));
-  try {
-    localStorage.setItem(authStorageKey(), JSON.stringify(cur));
-  } catch (e) { return false; }
-  return true;
-}
-
-/* 距离真实过期还有多少秒 */
-function nativeSessionRemainingSec() {
-  if (!NATIVE_SHELL) return 0;
-  let realExp = 0;
-  try { realExp = Number(localStorage.getItem(NATIVE_REAL_EXP_KEY) || 0); } catch (e) { realExp = 0; }
-  if (!realExp) {
-    const cur = readRawSession();
-    realExp = cur ? sessionRealExp(cur) : 0;
-  }
-  if (!realExp) return 0;
-  return realExp - Math.floor(Date.now() / 1000);
-}
-
-/* 保活：只在「已登录 + 接近真实过期」时才向原生要新 token。
-   每分钟一次纯本地判断，几乎零成本；真正跨进程大约每小时一次。 */
-function nativeKeeperTick(force) {
-  if (!NATIVE_SHELL || !window.AndroidBridge || !sessionUser) return;
-  const remain = nativeSessionRemainingSec();
-  if (!force && remain > NATIVE_SYNC_AHEAD) return;
-  syncNativeSession(remain <= 60 ? 'force' : 'fresh', force ? 'resume' : 'keeper');
-}
-
+/* 保活：每 20 分钟让原生检查一次（原生只在距过期 <180s 时才真发请求）。
+   目的只是避免"用户长时间不动、回来第一次请求要等一次同步刷新"。 */
 function startNativeSessionKeeper() {
   if (!NATIVE_SHELL || nativeKeeperTimer) return;
   nativeKeeperTimer = setInterval(function () {
-    try { nativeKeeperTick(false); } catch (e) {}
-  }, 60 * 1000);
+    if (!sessionUser || isExplicitSigningOut) return;
+    try { window.AndroidBridge.getFreshSession(); } catch (e) {}
+  }, 20 * 60 * 1000);
+}
+
+/* 刷新安全存储状态（页面状态卡展示用） */
+function refreshSecurityState() {
+  if (!NATIVE_SHELL) return;
+  try {
+    const raw = window.AndroidBridge.getSecurityState() || '';
+    if (!raw) return;
+    const st = JSON.parse(raw);
+    nativeSecureStorageOk = !!st.secure;
+    if (!nativeSecureStorageOk) {
+      console.warn('[安全存储] Keystore 不可用，会话不会落盘：' + (st.reason || ''));
+    }
+  } catch (e) { /* 旧桥没有这个方法，忽略 */ }
 }
 
 /* 原生侧刷新成功后主动推送（MainActivity 用 evaluateJavascript 调这里）。
-   可能在 store.init() 之前到达：此时只落盘，等 supabase 客户端创建时自然读到。
-   多推几次无害 —— 旧会话会被 applyNativeSession 的单调判断挡掉。 */
+   只用来把"页面还没初始化完时已经登录"的状态补上；会话本身以原生存储为准。 */
 window.__onNativeSession = function (rawJson, reason) {
   if (!NATIVE_SHELL) return;
+  if (isExplicitSigningOut || Date.now() < suppressNativeSessionUntil) return;
   let nat = null;
   try { nat = rawJson ? JSON.parse(rawJson) : null; } catch (e) { return; }
-  if (!nat || !nat.access_token || !nat.refresh_token) return;
-  const applied = applyNativeSession(nat);
-  if (!applied) return;
-  if (!sessionUser && applied.user) {
-    sessionUser = applied.user;
+  if (!nat || !nat.access_token) return;
+  if (!sessionUser) {
+    sessionUser = nativeUser(nat);
     sessionPending = false;
     pendingSessionRecovery = false;
     try { hideAuth(); } catch (e) {}
@@ -1994,18 +1918,6 @@ window.__onNativeSession = function (rawJson, reason) {
     console.log('[原生会话] 启动期收到推送并已采纳（' + (reason || '') + '）');
   }
 };
-
-/* 从后台回到前台时检查一次：页面可能被系统冻结了几小时，
-   本地 token 早就到期，必须立刻向原生要新的，不能等下一次请求 401。 */
-if (NATIVE_SHELL) {
-  try {
-    document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState !== 'visible') return;
-      if (!sessionUser) return;
-      try { nativeKeeperTick(true); } catch (e) {}
-    });
-  } catch (e) {}
-}
 
 /* 原生模式专用 fetch：401 时先向原生要新 token，再带新 token 重试一次。
    只重试一次，不会打转；/auth/v1/ 的 401 交给 supabase-js 自己处理，
@@ -2015,7 +1927,7 @@ function nativeAwareFetch(input, init) {
   return fetch(input, init).then(function (res) {
     if (!NATIVE_SHELL || res.status !== 401) return res;
     if (url.indexOf('/auth/v1/') >= 0) return res;
-    const tok = syncNativeSession('force', 'http-401');
+    const tok = nativeForceRefreshToken();
     if (!tok) return res;
     const retryInit = Object.assign({}, init || {});
     try {
@@ -2030,12 +1942,11 @@ function nativeAwareFetch(input, init) {
   });
 }
 
-/* 把会话交给原生侧（登录、恢复、刷新后调用）。
-   用 JWT 的真实 exp，而不是本地被加了余量的 expires_at ——
-   否则原生会以为 token 还能多活 30 分钟，晚刷新一步。 */
+/* 把会话交给原生侧（登录后调用；会话本身已经由 storage.setItem 落到原生，
+   这里只保证小组件立刻刷新一次，不再依赖页面刷新） */
 function notifyNativeSession(session) {
   const bridge = window.AndroidBridge;
-  if (!bridge) return;
+  if (!bridge || isExplicitSigningOut) return;
   const token = session ? (session.access_token || '') : '';
   const refresh = session ? (session.refresh_token || '') : '';
   const realExp = session
@@ -2054,7 +1965,7 @@ function notifyNativeSession(session) {
   } catch (e) {}
 }
 
-/* 用户显式退出：唯一会清空原生会话的入口 */
+/* 清空原生会话（同时让小组件刷新成未登录） */
 function clearNativeSession() {
   const bridge = window.AndroidBridge;
   try { localStorage.removeItem(NATIVE_REAL_EXP_KEY); } catch (e) {}
@@ -2083,13 +1994,56 @@ async function getCurrentSession() {
     return (res && res.data) ? res.data.session : null;
   } catch (e) { return null; }
 }
+
+/**
+ * 彻底清空"本机会话状态"。用户主动退出时调用。
+ *
+ * 覆盖四层，少一层就会出现"退出后重启又登上了"：
+ *   1. 页面内存（sessionUser / sessionPending / pendingSessionRecovery / 定时器）
+ *   2. supabase 在 localStorage 的副本（原生模式已无，但清掉历史残留）
+ *   3. 原生 SessionManager（Keystore 密文）→ 小组件随之变成未登录
+ *   4. 数据缓存（避免下一位使用者看到上一位的账本）
+ */
+function clearLocalSessionState(reason) {
+  sessionUser = null;
+  sessionPending = false;
+  pendingSessionRecovery = false;
+  clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+  if (nativeKeeperTimer) {
+    clearInterval(nativeKeeperTimer);
+    nativeKeeperTimer = null;
+  }
+
+  try { localStorage.removeItem(authStorageKey()); } catch (e) {}
+  try { localStorage.removeItem(NATIVE_REAL_EXP_KEY); } catch (e) {}
+
+  clearNativeSession();
+
+  try {
+    localStorage.removeItem(CACHE_RECORDS_KEY);
+    localStorage.removeItem(CACHE_BUDGETS_KEY);
+    localStorage.removeItem(CACHE_AT_KEY);
+  } catch (e) {}
+  records = [];
+  budgets = [];
+
+  console.log('[会话] 已清空本机会话与缓存（' + (reason || '') + '）');
+}
+
 /* 会话被云端判死时的自救。
-   小组件在 App 关闭期间一直在续期，原生侧那份通常比 WebView 的更新；
-   所以先把它同步回来，能救就不弹登录页。10 分钟内最多试 3 次，防止打转。
-   这里**不**清原生会话：小组件还在用它，清掉只会让两边一起死。 */
+   原生模式下"存储就是原生"，重新读一次 getSession 即可（storage 适配器会给出
+   原生当前会话）；不再调 setSession()，也就不会触发 extra 的 /user 请求或轮换。
+   主动退出期间禁止自救，否则会把刚退掉的会话恢复回来。 */
 let authRecoveryCount = 0;
 let authRecoveryWindowStart = 0;
 function recoverSessionFromNative() {
+  if (isExplicitSigningOut || Date.now() < suppressNativeSessionUntil) return;
+  if (!NATIVE_SHELL) {
+    showAuth();
+    switchAuthTabs('login');
+    return;
+  }
   const now = Date.now();
   if (now - authRecoveryWindowStart > 10 * 60 * 1000) {
     authRecoveryWindowStart = now;
@@ -2103,16 +2057,28 @@ function recoverSessionFromNative() {
   }
   authRecoveryCount++;
   console.log('尝试从原生侧恢复会话，第 ' + authRecoveryCount + ' 次');
-  const tok = NATIVE_SHELL ? syncNativeSession('force', 'signed-out') : null;
-  if (tok) {
-    console.log('已从原生侧恢复会话');
-    hideAuth();
-    refreshData().catch(function () {});
-    renderAll();
-  } else {
+
+  const nat = readRawSession();
+  if (!nat || !nat.access_token) {
     showAuth();
     switchAuthTabs('login');
+    return;
   }
+  Promise.resolve(supabaseClient.auth.getSession()).then(function (r) {
+    const s = r && r.data && r.data.session;
+    if (s && s.user) {
+      sessionUser = s.user;
+      hideAuth();
+      refreshData().catch(function () {});
+      renderAll();
+    } else {
+      showAuth();
+      switchAuthTabs('login');
+    }
+  }).catch(function () {
+    showAuth();
+    switchAuthTabs('login');
+  });
 }
 async function handleAuthSubmit(e) {
   e.preventDefault();
@@ -2149,10 +2115,11 @@ async function handleAuthSubmit(e) {
         return;
       }
     }
-    // 把完整会话同步给原生侧（小组件靠 refresh_token 自行续期）
+    // 把完整会话同步给原生侧（同时刷新一次桌面小组件）。
+    // 会话本身已经由 NativeAuthStorage.setItem 落到 Keystore 加密存储里。
     notifyNativeSession(session || await getCurrentSession());
-    // 原生模式下给本地 expires_at 加余量，防止 supabase-js 到点后自己去轮换
-    if (NATIVE_SHELL) normalizeLocalSessionExpiry();
+    // 退出登录时保活定时器被清掉了，重新登录要恢复
+    try { startNativeSessionKeeper(); } catch (e) {}
     useSupabase = true;
     hideAuth();
     await refreshData();
@@ -2169,21 +2136,43 @@ async function handleAuthSubmit(e) {
     btn.textContent = authMode === 'login' ? '登录' : '注册';
   }
 }
+/**
+ * 主动退出登录。
+ *
+ * 顺序很关键：`signOut()` 内部会**同步**触发 SIGNED_OUT，而监听器一旦看到
+ * "本地会话没了"就会去原生自救 —— 那正好把刚退掉的会话恢复回来。
+ * 所以必须**先立标记**，再调 signOut，最后统一清理。
+ *
+ * 清理覆盖四层（见 clearLocalSessionState）：页面内存 / supabase 副本 /
+ * 原生 Keystore 存储 / 数据缓存。退出后 5 秒内继续抑制原生推送与自救，
+ * 防止延迟到达的回调把会话带回来。
+ */
 async function signOutAccount() {
   if (!store.isSupabase()) return;
   if (!confirm('确定退出登录吗？退出后本机将不再显示云端数据。')) return;
-  await supabaseClient.auth.signOut();
-  sessionUser = null;
-  pendingSessionRecovery = false;
-  sessionPending = false;
-  clearTimeout(recoveryTimer);
-  // 【关键】用户显式退出，是唯一会清空原生会话的路径：
-  // 小组件随之停止续期并显示「请先在 App 中登录」，不会残留旧 token。
-  clearNativeSession();
-  showAuth();
-  switchAuthTabs('login');
-  document.getElementById('authEmail').value = '';
-  document.getElementById('authPassword').value = '';
+
+  isExplicitSigningOut = true;
+  try {
+    try {
+      await supabaseClient.auth.signOut();
+    } catch (e) {
+      // 云端登出失败（断网等）也必须清理本地，否则等于"点了没反应"
+      console.warn('[会话] 云端登出请求失败，继续清理本地会话：', e);
+    }
+  } finally {
+    clearLocalSessionState('user-signout');
+    showAuth();
+    switchAuthTabs('login');
+    document.getElementById('authEmail').value = '';
+    document.getElementById('authPassword').value = '';
+    renderAll();
+    isExplicitSigningOut = false;
+    // 抑制窗口：覆盖可能还在路上的 SIGNED_OUT / 原生推送
+    suppressNativeSessionUntil = Date.now() + 5000;
+    authRecoveryCount = 0;
+    authRecoveryWindowStart = 0;
+    showToast('已退出登录');
+  }
 }
 function renderAccountCard() {
   const name = document.getElementById('accountName');
@@ -2267,6 +2256,10 @@ function renderStorageStatus() {
   }
   if (lastNetCheck) {
     desc.textContent = (desc.textContent ? desc.textContent + ' ' : '') + lastNetCheck;
+  }
+  // 原生模式：安全存储异常要显式说出来（Keystore 不可用时会话不落盘）
+  if (NATIVE_SHELL && nativeSecureStorageOk === false) {
+    desc.textContent = '⚠️ 系统安全存储（Keystore）不可用，本次登录会话不会保存，重启 App 后需要重新登录。';
   }
   // 认证模式一眼可见：真机上没法看控制台，靠这行确认装的是哪套逻辑
   const authModeLabel = NATIVE_SHELL ? 'Android 原生会话' : '浏览器自动刷新';
@@ -2408,8 +2401,9 @@ async function init() {
     noteBootError('存储初始化异常', e);
   }
   storeReady = true;
-  // 原生模式：起一个轻量保活定时器（每分钟本地判断一次，只有临期才跨进程取新 token）
+  // 原生模式：起一个轻量保活定时器（20 分钟一次，原生只在临期时才真发请求）
   try { startNativeSessionKeeper(); } catch (e) {}
+  try { refreshSecurityState(); } catch (e) {}
   if (storeRes === TIMEOUT) {
     // 超时绝不能掉进下面的「本地存储」分支——那会显示一份空数据，比等着更糟。
     // store.init() 其实还在后台继续跑，它一完成就补渲染。
