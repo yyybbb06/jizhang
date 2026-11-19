@@ -5,11 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>学生每日记账工作台</title>
 <!-- Supabase 客户端（本地化，避免 CDN 不可达导致回退 localStorage）
-     必须加 defer：脚本共约 420KB，阻塞加载会让页面在弱网下白屏数十秒；
-     defer 保证 DOM 先渲染，且仍在 DOMContentLoaded 之前执行完毕。 -->
+     必须加 defer：脚本 212KB，阻塞加载会让页面在弱网下白屏；
+     defer 保证 DOM 先渲染，且仍在 DOMContentLoaded 之前执行完毕。
+     ⚠️ 页面 init() 挂在 DOMContentLoaded 上，所以**任何** defer 脚本都会推迟首屏初始化。
+     Chart.js（208KB）已从这里移除，改为首次需要画图时按需加载 —— 图表所在的
+     「统计 / 结余」页在启动时是隐藏的，没必要为它付 208KB 的解析时间。 -->
 <script defer src="vendor/supabase.min.js"></script>
-<!-- Chart.js（本地化） -->
-<script defer src="vendor/chart.umd.js"></script>
 <style>
 /* ========== 主题变量 ========== */
 :root{
@@ -557,7 +558,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_0L5xb99yAoshdHFjnvIc0Q_TeAJsd_k';
 /* 页面版本戳：显示在「关于与存储状态」里。
    真机上看不到控制台，有这个戳就能一眼确认手机上跑的是哪一版，
    不用再靠猜（之前几轮排查一直卡在「你装的到底是不是最新版」上）。 */
-const APP_BUILD = '2026-11-17.2';
+const APP_BUILD = '2026-11-19.1';
 
 const STORAGE_RECORDS_KEY = 'finance_records';
 const STORAGE_BUDGETS_KEY = 'finance_budgets';
@@ -627,6 +628,52 @@ function withTimeout(promise, ms) {
     new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms)),
   ]);
 }
+/* ===================== 启动耗时埋点 =====================
+   只用 performance.now()（距 navigationStart 的毫秒数），没有额外依赖。
+   三个出口：
+     1. console：[启动] 一行汇总
+     2. 状态卡：设置 →「关于与存储状态」直接显示，真机不用连电脑
+     3. logcat：原生的 reportStartup() 打到 tag=StartupPerf，和原生时间线对齐
+   `adb logcat -s StartupPerf` 可看完整时间线。 */
+const PERF = { marks: {} };
+function perfMark(name) {
+  if (PERF.marks[name] != null) return;
+  const t = (window.performance && performance.now) ? performance.now() : 0;
+  PERF.marks[name] = Math.round(t);
+}
+function perfDelta(from, to) {
+  const a = PERF.marks[from], b = PERF.marks[to];
+  return (a == null || b == null) ? null : (b - a);
+}
+function startupReport() {
+  return {
+    dcl: PERF.marks['dcl'] == null ? null : PERF.marks['dcl'],
+    shell: PERF.marks['shell-rendered'] == null ? null : PERF.marks['shell-rendered'],
+    session: perfDelta('session-start', 'session-ready'),
+    auth: PERF.marks['auth-ok'] == null ? null : PERF.marks['auth-ok'],
+    interactive: PERF.marks['interactive'] == null ? null : PERF.marks['interactive'],
+    data: PERF.marks['data-ready'] == null ? null : PERF.marks['data-ready'],
+  };
+}
+function startupLine() {
+  const r = startupReport();
+  if (r.interactive == null) return '';
+  const s2 = (ms) => (ms == null ? '—' : (ms / 1000).toFixed(2) + 's');
+  const dataCost = (r.data == null) ? null : Math.max(0, r.data - r.interactive);
+  return '首屏 ' + s2(r.interactive) + '（页面 ' + s2(r.shell) +
+    '/会话 ' + s2(r.session) + '/数据 ' + s2(dataCost) + '）';
+}
+function reportStartup() {
+  const line = startupLine();
+  if (!line) return;
+  const r = startupReport();
+  console.log('[启动] ' + line, r);
+  const bridge = window.AndroidBridge;
+  if (bridge && typeof bridge.reportStartup === 'function') {
+    try { bridge.reportStartup(JSON.stringify(r)); } catch (e) {}
+  }
+}
+
 function pad(n) { return String(n).padStart(2, '0'); }
 function toDateStr(d) {
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
@@ -714,12 +761,10 @@ const store = {
         // 【顺序关键】原生模式下先让原生把会话准备好（临期则先续一次）。
         // 之后 createClient() 会通过 NativeAuthStorage 读原生存储 —— 拿到的
         // 一定是新鲜会话，supabase-js 因此不会自己发起任何刷新。
-        let nativeBootOk = false;
-        if (NATIVE_SHELL) {
-          try { nativeBootOk = !!window.AndroidBridge.getFreshSession(); }
-          catch (e) { console.warn('引导原生会话异常：', e); }
-          refreshSecurityState();
-        }
+        // 【性能】这里不再调用 getFreshSession() 预热：
+        // 自定义 storage 的 getItem 本来就会读原生（必要时后台续期），
+        // 多这一跳只会让启动路径多一次同步桥调用、多一次可能的网络等待。
+        const nativeBootOk = NATIVE_SHELL;
         // 认证选项按环境分流；storage 只在原生模式下替换
         const authOptions = {
           persistSession: true,
@@ -972,8 +1017,11 @@ function cacheAgeLabel() {
 
 async function refreshData() {
   try {
-    records = await store.loadRecords();
-    budgets = await store.loadBudgets();
+    // 两张表并行拉：串行等于把两倍 RTT 叠在首屏上。
+    // Promise.all 任一失败都会 reject，语义与原串行版本一致（都进 catch）。
+    const pair = await Promise.all([store.loadRecords(), store.loadBudgets()]);
+    records = pair[0];
+    budgets = pair[1];
     saveDataCache();          // 成功后落缓存，下次冷启动可以秒出
   } catch (e) {
     console.error('加载数据失败：', e);
@@ -983,6 +1031,8 @@ async function refreshData() {
     showToast('⚠️ 暂时无法同步，正在显示本机缓存');
   }
   renderAll();
+  perfMark('data-ready');
+  reportStartup();
 }
 
 /* ===================== 示例数据 ===================== */
@@ -1017,6 +1067,9 @@ function switchView(view) {
     n.classList.toggle('active', n.dataset.view === view);
   });
   window.scrollTo(0, 0);
+  // 图表延后绘制：切到对应页面时才画（库也是这时才按需加载）
+  if (view === 'stats') drawStatsCharts();
+  else if (view === 'balance') drawBalanceCharts();
 }
 
 /* ===================== 记账表单 ===================== */
@@ -1289,10 +1342,8 @@ function renderStats() {
   document.getElementById('budgetPercent').textContent = budget > 0 ? pctShow + '%' : '--';
   document.getElementById('budgetAlert').classList.toggle('show', budget > 0 && budgetExpense > budget);
 
-  drawExpenseCatChart();
-  drawIncomeCatChart();
-  drawTrendChart();
-  drawYearlyChart();
+  // 图表延后到「统计」页可见时再画（见 drawStatsCharts / ensureChartLib）
+  drawStatsCharts();
 }
 
 function statCard(label, value, cls, sub) {
@@ -1345,6 +1396,54 @@ const barValuePlugin = {
     });
   },
 };
+
+/* ---------- Chart.js 按需加载 ----------
+   208KB 的解析如果放在 <head> 的 defer 里，会推迟 DOMContentLoaded，
+   而 init() 正是挂在 DOMContentLoaded 上的 —— 等于每次启动都白等一次图表库解析。
+   这里改成"要画图了才加载"，并且只在对应页面可见时才画。
+   资源仍然是本地 vendor/chart.umd.js（不走 CDN），请求会被 MainActivity 拦截从 assets 应答。 */
+let chartLibPromise = null;
+function ensureChartLib() {
+  if (window.Chart) return Promise.resolve(true);
+  if (chartLibPromise) return chartLibPromise;
+  chartLibPromise = new Promise(function (resolve, reject) {
+    try {
+      const s = document.createElement('script');
+      s.src = 'vendor/chart.umd.js';
+      s.async = true;
+      s.onload = function () { resolve(true); };
+      s.onerror = function () { chartLibPromise = null; reject(new Error('Chart.js 加载失败')); };
+      document.head.appendChild(s);
+    } catch (e) { chartLibPromise = null; reject(e); }
+  });
+  return chartLibPromise;
+}
+/* 该页是否正在显示（隐藏页画图是纯浪费：canvas 尺寸为 0，Chart 还要走一遍完整绘制流程） */
+function isViewActive(view) {
+  try {
+    const el = document.getElementById('view-' + view);
+    return !!(el && el.classList && el.classList.contains('active'));
+  } catch (e) { return false; }
+}
+/* 统计页的 4 张图：只在可见且库已就绪时画 */
+function drawStatsCharts() {
+  if (!isViewActive('stats')) return;
+  if (!window.Chart) {
+    ensureChartLib().then(function () { drawStatsCharts(); }).catch(function (e) {
+      console.warn('图表库加载失败：', e);
+    });
+    return;
+  }
+  drawExpenseCatChart();
+  drawIncomeCatChart();
+  drawTrendChart();
+  drawYearlyChart();
+}
+/* 结余页的图：renderBalance 内部会自己判断，这里只是个入口 */
+function drawBalanceCharts() {
+  if (!isViewActive('balance')) return;
+  renderBalance();
+}
 
 function makeChart(key, cfg) {
   if (typeof Chart === 'undefined') return; // Chart.js CDN 未加载时跳过
@@ -1548,21 +1647,30 @@ function renderBalance() {
     balanceArr = years.map(y => map[y].income - map[y].expense);
     rowsHtml = years.slice().reverse().map(y => balanceRow(y, map[y].income, map[y].expense, map[y].income - map[y].expense)).join('');
   }
-  const opts = chartBaseOptions();
-  opts.plugins.legend.position = 'bottom';
-  makeChart('chartBalance', {
-    type: 'bar',
-    data: {
-      labels: labels,
-      datasets: [
-        { label: '收入', data: incomeArr, backgroundColor: 'rgba(16,185,129,.75)', borderRadius: 5 },
-        { label: '支出', data: expenseArr, backgroundColor: 'rgba(239,68,68,.75)', borderRadius: 5 },
-        { label: '结余', data: balanceArr, backgroundColor: 'rgba(59,130,246,.6)', borderRadius: 5 },
-      ],
-    },
-    options: opts,
-    plugins: [barValuePlugin],
-  });
+  // 图表：只在「结余」页可见时才画；库未加载时按需加载后重画
+  if (isViewActive('balance')) {
+    if (window.Chart) {
+      const opts = chartBaseOptions();
+      opts.plugins.legend.position = 'bottom';
+      makeChart('chartBalance', {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [
+            { label: '收入', data: incomeArr, backgroundColor: 'rgba(16,185,129,.75)', borderRadius: 5 },
+            { label: '支出', data: expenseArr, backgroundColor: 'rgba(239,68,68,.75)', borderRadius: 5 },
+            { label: '结余', data: balanceArr, backgroundColor: 'rgba(59,130,246,.6)', borderRadius: 5 },
+          ],
+        },
+        options: opts,
+        plugins: [barValuePlugin],
+      });
+    } else {
+      ensureChartLib().then(function () { drawBalanceCharts(); }).catch(function (e) {
+        console.warn('图表库加载失败：', e);
+      });
+    }
+  }
   document.getElementById('balanceList').innerHTML = rowsHtml || '<div class="empty" style="padding:24px 0">暂无数据</div>';
 }
 
@@ -2265,6 +2373,9 @@ function renderStorageStatus() {
   const authModeLabel = NATIVE_SHELL ? 'Android 原生会话' : '浏览器自动刷新';
   desc.textContent = (desc.textContent ? desc.textContent + ' ' : '') +
     '（' + authModeLabel + ' · 页面版本 ' + APP_BUILD + '）';
+  // 启动耗时：真机不连电脑也能看到（点「设置」即可）
+  const sl = startupLine();
+  if (sl) desc.textContent += '｜' + sl;
   renderAccountCard();
 }
 
@@ -2369,6 +2480,7 @@ function bindEvents() {
 
 /* ===================== 初始化 ===================== */
 async function init() {
+  perfMark('init-start');
   bindEvents();
   // 主题
   const savedTheme = localStorage.getItem(THEME_KEY) || 'light';
@@ -2390,10 +2502,12 @@ async function init() {
   try { loadDataCache(); } catch (e) { console.warn('读取本机缓存失败：', e); }
   // 再渲染界面主体，避免网络慢时整页停在占位状态（「正在检测…」「未登录」）
   try { renderShell(); } catch (e) { noteBootError('渲染界面失败', e); }
+  perfMark('shell-rendered');
   // 初始化存储：整体再加一层超时兜底。
   // 界面能否从「正在检测…」翻篇，取决于 store.init() 是否返回；这里保证它一定返回。
   let storePromise = null;
   let storeRes = null;
+  perfMark('session-start');
   try {
     storePromise = store.init();
     storeRes = await withTimeout(storePromise, 25000);
@@ -2401,9 +2515,13 @@ async function init() {
     noteBootError('存储初始化异常', e);
   }
   storeReady = true;
+  perfMark('session-ready');
   // 原生模式：起一个轻量保活定时器（20 分钟一次，原生只在临期时才真发请求）
   try { startNativeSessionKeeper(); } catch (e) {}
-  try { refreshSecurityState(); } catch (e) {}
+  // 安全存储状态不是首屏必需：推迟到首屏之后再问原生（一次 KeyStore 查询）
+  setTimeout(function () {
+    try { refreshSecurityState(); renderStorageStatus(); } catch (e) {}
+  }, 1200);
   if (storeRes === TIMEOUT) {
     // 超时绝不能掉进下面的「本地存储」分支——那会显示一份空数据，比等着更糟。
     // store.init() 其实还在后台继续跑，它一完成就补渲染。
@@ -2415,9 +2533,17 @@ async function init() {
       storeReady = true;
       try { startNativeSessionKeeper(); } catch (e) {}
       if (store.isSupabase()) {
-        if (sessionUser) { hideAuth(); await refreshData().catch(() => {}); }
+        if (sessionUser) {
+          hideAuth();
+          perfMark('auth-ok');
+          renderAll();
+          perfMark('interactive');
+          reportStartup();
+          refreshData().catch(() => {});
+          return;
+        }
         // 本地还有会话就绝不弹登录页：网络慢不等于未登录
-        else if (!readRawSession()) { showAuth(); switchAuthTabs('login'); }
+        if (!readRawSession()) { showAuth(); switchAuthTabs('login'); }
       }
       renderAll();
     }).catch(() => {});
@@ -2425,9 +2551,17 @@ async function init() {
   }
   if (store.isSupabase()) {
     if (sessionUser) {
-      // 已登录
+      // 已登录：先出首屏（用本机缓存），数据在后台补 —— 绝不 await 网络再渲染
       hideAuth();
-      await refreshData();
+      perfMark('auth-ok');
+      const cachedBudget = budgets.find(x => x.month === curMonth());
+      document.getElementById('budgetAmount').value = cachedBudget ? cachedBudget.budget : '';
+      renderAll();
+      perfMark('interactive');
+      reportStartup();
+      refreshData().catch(function (e) { console.warn('后台刷新数据失败：', e); });
+      console.log('记账工作台：已登录，首屏用缓存渲染，数据后台同步中');
+      return;
     } else if (sessionPending) {
       // 本地有会话但还没跟云端确认：立刻用本机缓存把界面撑起来，
       // 不要让用户对着「正在恢复登录状态…」干等。确认成功后会自动补拉数据。
@@ -2469,6 +2603,7 @@ async function init() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  perfMark('dcl');
   init().catch(err => {
     console.error('初始化失败：', err);
     showToast('⚠️ 初始化失败：' + (err.message || '未知错误'));
